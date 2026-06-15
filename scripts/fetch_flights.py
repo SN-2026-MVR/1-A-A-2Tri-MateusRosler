@@ -1,20 +1,19 @@
 """
-fetch_historico_anac.py — Dados históricos ANAC/VRA + Supabase
-Busca o arquivo VRA (Voo Regular Ativo) do portal de dados abertos da ANAC,
-processa e insere na tabela historico_vra do Supabase.
-
-Execução: mensal (1º dia de cada mês via GitHub Actions)
+fetch_flights.py — SIROS/ANAC + Supabase v2
+Melhorias aplicadas:
+  - Logs renomeados: "enviados/processados" em vez de "inseridos/atualizados"
+  - Upsert explicado: evita duplicatas via constraint voos_unique
+  - execucoes registra: voos_processados, lotes_enviados, erros
+  - Falha parcial gera status "erro_parcial" e falha o workflow (exit 1)
+  - Falha crítica gera status "erro_critico"
 
 Variáveis de ambiente:
   SUPABASE_URL         → URL do projeto (GitHub Secret)
   SUPABASE_SERVICE_KEY → secret key / service_role key (GitHub Secret)
-  AIRPORTS             → ICAOs para filtrar (GitHub Variable)
-  ANO_MES              → Período a buscar no formato AAAA-MM
-                         Padrão: mês anterior ao atual
+  AIRPORTS             → ICAOs separados por vírgula (GitHub Variable)
 """
 
-import csv
-import io
+import json
 import os
 import sys
 from datetime import datetime, timezone, timedelta
@@ -29,6 +28,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("[ERRO CRÍTICO] SUPABASE_URL e SUPABASE_SERVICE_KEY são obrigatórios.")
+    print("              Configure-os como GitHub Secrets no repositório.")
     sys.exit(1)
 
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -36,190 +36,223 @@ print(f"Supabase conectado: {SUPABASE_URL}")
 
 # ── Configurações ─────────────────────────────────────────────────────────────
 
+API_BASE     = "https://sas.anac.gov.br/sas/siros_api"
 airports_env = os.environ.get("AIRPORTS", "SBCA")
 AIRPORTS     = [a.strip().upper() for a in airports_env.split(",") if a.strip()]
-LOTE         = 500
+LOTE         = 500   # registros por requisição ao Supabase
 
-# Período: usa mês anterior por padrão (o VRA do mês atual fica disponível
-# somente após o fechamento do mês)
-BRT  = timezone(timedelta(hours=-3))
-hoje = datetime.now(BRT)
+BRT      = timezone(timedelta(hours=-3))
+hoje     = datetime.now(BRT)
+data_ref = hoje.strftime("%d%m%Y")
+data_iso = hoje.strftime("%Y-%m-%d")
 
-if os.environ.get("ANO_MES"):
-    ano_mes = os.environ["ANO_MES"].strip()  # ex: 2026-04
-else:
-    primeiro_do_mes = hoje.replace(day=1)
-    mes_anterior    = primeiro_do_mes - timedelta(days=1)
-    ano_mes         = mes_anterior.strftime("%Y-%m")
+print(f"Data de referência: {hoje.strftime('%d/%m/%Y')} (BRT)")
+print(f"Aeroportos configurados: {', '.join(AIRPORTS)}")
 
-ano, mes = ano_mes.split("-")
+# ── Mapeamentos ───────────────────────────────────────────────────────────────
 
-print(f"Período histórico: {ano_mes}")
-print(f"Aeroportos filtrados: {', '.join(AIRPORTS)}")
+AIRLINES = {
+    "GLO": "GOL",     "TAM": "LATAM",   "AZU": "Azul",
+    "ONE": "VOEPASS",  "PTB": "Passaredo","TAP": "TAP Portugal",
+    "DAL": "Delta",   "UAL": "United",   "AFR": "Air France",
+    "DLH": "Lufthansa","IBE": "Iberia",  "AAL": "American Airlines",
+    "AVA": "Avianca", "BAW": "British Airways","UAE": "Emirates",
+    "THY": "Turkish Airlines","SKU": "Sky Airline","CMP": "Copa Airlines",
+}
 
-# ── URL do VRA ────────────────────────────────────────────────────────────────
-# Formato do portal ANAC:
-# https://sistemas.anac.gov.br/dadosabertos/Voos%20e%20opera%C3%A7%C3%B5es/VRA/YYYY/AAAAMM.csv
-VRA_URL = (
-    f"https://sistemas.anac.gov.br/dadosabertos/"
-    f"Voos%20e%20opera%C3%A7%C3%B5es/VRA/{ano}/{ano}{mes}.csv"
-)
-
-# URL alternativa (portal de dados abertos)
-VRA_URL_ALT = (
-    f"https://www.gov.br/anac/pt-br/assuntos/dados-e-estatisticas/"
-    f"dados-estatisticos/arquivos/VRA{ano}{mes}.csv"
-)
-
-# Mapeamento de colunas do CSV do VRA
-# (nomes reais no arquivo — podem variar levemente entre versões)
-COLS = {
-    "empresa":       ["EMPRESA (SIGLA)", "Empresa (Sigla)", "sg_empresa_icao"],
-    "voo":           ["NÚMERO VOO",      "Numero Voo",      "nr_voo"],
-    "origem":        ["ORIGEM",          "Aeroporto Origem","sg_icao_origem"],
-    "destino":       ["DESTINO",         "Aeroporto Destino","sg_icao_destino"],
-    "dt_ref":        ["DT_REFERENCIA",   "Dt Referencia",   "data_referencia"],
-    "partida_prev":  ["PARTIDA PREVISTA","Partida Prevista", "dt_partida_prevista"],
-    "partida_real":  ["PARTIDA REAL",    "Partida Real",    "dt_partida_real"],
-    "chegada_prev":  ["CHEGADA PREVISTA","Chegada Prevista", "dt_chegada_prevista"],
-    "chegada_real":  ["CHEGADA REAL",    "Chegada Real",    "dt_chegada_real"],
-    "situacao":      ["SITUAÇÃO DE VOO", "Situacao Voo",    "situacao"],
-    "motivo":        ["MOTIVO",          "Motivo Alteracao","motivo_alteracao"],
+EQUIPAMENTOS = {
+    "A20N":"Airbus A320neo","A21N":"Airbus A321neo","A319":"Airbus A319",
+    "A320":"Airbus A320","A321":"Airbus A321","A332":"Airbus A330-200",
+    "A333":"Airbus A330-300","A339":"Airbus A330-900neo",
+    "A359":"Airbus A350-900","B737":"Boeing 737","B738":"Boeing 737-800",
+    "B38M":"Boeing 737 MAX 8","B748":"Boeing 747-8","B763":"Boeing 767-300",
+    "B77W":"Boeing 777-300ER","B788":"Boeing 787-8","B789":"Boeing 787-9",
+    "E190":"Embraer E190","E195":"Embraer E195","E295":"Embraer E195-E2",
+    "AT76":"ATR 72",
 }
 
 
-def get_col(row: dict, key: str) -> str:
-    """Tenta múltiplos nomes de coluna para compatibilidade entre versões do CSV."""
-    for nome in COLS.get(key, [key]):
-        if nome in row:
-            return (row[nome] or "").strip()
-    return ""
+def get_airline(icao: str) -> str:
+    return AIRLINES.get((icao or "").strip().upper(), (icao or "").strip() or "?")
 
 
-def parse_dt_anac(dt_str: str) -> str | None:
-    """Converte 'DD/MM/YYYY HH:MM' para ISO UTC."""
+def get_equip(icao: str) -> str | None:
+    code = (icao or "").strip().upper()
+    return EQUIPAMENTOS.get(code, code or None)
+
+
+def get_tipo_operacao(ds: str) -> str:
+    return "Internacional" if "INTERNAC" in (ds or "").upper() else "Doméstico"
+
+
+def parse_siros_dt(dt_str: str) -> str | None:
+    """Converte 'DD/MM/YYYY HH:MM' (UTC da API) para ISO com timezone UTC."""
     if not dt_str or len(dt_str) < 16:
         return None
-    for fmt in ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S"):
-        try:
-            dt = datetime.strptime(dt_str.strip(), fmt)
-            return dt.replace(tzinfo=timezone.utc).isoformat()
-        except ValueError:
-            continue
-    return None
-
-
-def diff_minutos(partida_prev: str, partida_real: str) -> int | None:
-    """Calcula atraso em minutos entre horário previsto e real."""
     try:
-        fmt = "%d/%m/%Y %H:%M"
-        dp  = datetime.strptime(partida_prev.strip(), fmt)
-        dr  = datetime.strptime(partida_real.strip(), fmt)
-        return int((dr - dp).total_seconds() / 60)
+        dt = datetime.strptime(dt_str.strip(), "%d/%m/%Y %H:%M")
+        return dt.replace(tzinfo=timezone.utc).isoformat()
     except Exception:
         return None
 
 
-# ── Busca o arquivo VRA ───────────────────────────────────────────────────────
-
-def baixar_vra() -> list[dict]:
-    for url in [VRA_URL, VRA_URL_ALT]:
-        print(f"\nGET {url}")
-        try:
-            r = requests.get(url, timeout=120)
-            if r.status_code == 404:
-                print(f"  Não encontrado (404) — tentando URL alternativa.")
-                continue
-            r.raise_for_status()
-            # Decodifica com latin-1 (padrão do VRA)
-            texto = r.content.decode("latin-1", errors="replace")
-            reader = csv.DictReader(io.StringIO(texto), delimiter=";")
-            registros = list(reader)
-            print(f"  VRA carregado: {len(registros)} linhas brutas")
-            return registros
-        except Exception as e:
-            print(f"  [ERRO] {e}")
-    return []
+def parse_hora(dt_str: str) -> str | None:
+    """Extrai HH:MM:00 de 'DD/MM/YYYY HH:MM'."""
+    if not dt_str or len(dt_str) < 16:
+        return None
+    try:
+        return dt_str.strip()[11:16] + ":00"
+    except Exception:
+        return None
 
 
-# ── Processa e filtra registros ───────────────────────────────────────────────
+# ── Busca voos no SIROS ───────────────────────────────────────────────────────
 
-def processar_vra(linhas: list[dict]) -> list[dict]:
-    resultado = []
-    for row in linhas:
-        origem  = get_col(row, "origem").upper()
-        destino = get_col(row, "destino").upper()
-        if origem not in AIRPORTS and destino not in AIRPORTS:
-            continue
-
-        empresa       = get_col(row, "empresa")
-        nr_voo        = get_col(row, "voo")
-        dt_ref_str    = get_col(row, "dt_ref")
-        partida_prev  = get_col(row, "partida_prev")
-        partida_real  = get_col(row, "partida_real")
-        chegada_prev  = get_col(row, "chegada_prev")
-        chegada_real  = get_col(row, "chegada_real")
-        situacao      = get_col(row, "situacao")
-        motivo        = get_col(row, "motivo")
-
-        # Data de referência
-        dt_ref = None
-        if dt_ref_str:
-            try:
-                for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
-                    try:
-                        dt_ref = datetime.strptime(dt_ref_str.strip(), fmt).date().isoformat()
-                        break
-                    except ValueError:
-                        continue
-            except Exception:
-                pass
-
-        resultado.append({
-            "ano_mes":          ano_mes,
-            "icao_empresa":     empresa or None,
-            "nr_voo":           nr_voo or None,
-            "icao_origem":      origem or None,
-            "icao_destino":     destino or None,
-            "dt_referencia":    dt_ref,
-            "partida_real":     parse_dt_anac(partida_real),
-            "chegada_real":     parse_dt_anac(chegada_real),
-            "atraso_partida":   diff_minutos(partida_prev, partida_real),
-            "atraso_chegada":   diff_minutos(chegada_prev, chegada_real),
-            "situacao":         situacao.lower() if situacao else None,
-            "motivo_alteracao": motivo or None,
-        })
-
-    print(f"  Registros filtrados para os aeroportos configurados: {len(resultado)}")
-    return resultado
+def buscar_voos_siros() -> list:
+    url = f"{API_BASE}/voos"
+    print(f"\nGET {url}?dataReferencia={data_ref}")
+    try:
+        r = requests.get(url, params={"dataReferencia": data_ref}, timeout=60)
+        r.raise_for_status()
+        decoded = r.json()
+        if isinstance(decoded, str):
+            decoded = json.loads(decoded)
+        if isinstance(decoded, list):
+            print(f"  Total retornado pela API SIROS: {len(decoded)} voos")
+            return decoded
+        print(f"  [AVISO] Formato inesperado na resposta: {type(decoded)}")
+        return []
+    except Exception as e:
+        print(f"  [ERRO] Falha ao buscar voos no SIROS: {e}")
+        return []
 
 
-# ── Inserção no Supabase ──────────────────────────────────────────────────────
+def normalizar_voo(f: dict) -> dict:
+    empresa = (f.get("sg_empresa_icao")          or "").strip()
+    nr_voo  = (f.get("nr_voo")                   or "").strip().lstrip("0") or "0"
+    etapa   = str(f.get("nr_etapa")              or "1").strip()
+    equip   = (f.get("sg_equipamento_icao")       or "").strip()
+    assent  = f.get("qt_assentos_previstos")
+    partida = (f.get("dt_partida_prevista_utc")  or "").strip()
+    chegada = (f.get("dt_chegada_prevista_utc")  or "").strip()
+    tipo    = (f.get("ds_tipo_servico")           or "").strip()
+    origem  = (f.get("sg_icao_origem")            or "").strip().upper()
+    destino = (f.get("sg_icao_destino")           or "").strip().upper()
 
-linhas_vra  = baixar_vra()
-if not linhas_vra:
-    print("\n[AVISO] VRA não disponível para o período. Encerrando.")
+    return {
+        "data_referencia": data_iso,
+        "icao_empresa":    empresa or None,
+        "nome_empresa":    get_airline(empresa),
+        "numero_voo":      nr_voo,
+        "etapa":           etapa,
+        "icao_origem":     origem or None,
+        "icao_destino":    destino or None,
+        "hr_partida_utc":  parse_hora(partida),
+        "hr_chegada_utc":  parse_hora(chegada),
+        "partida_iso":     parse_siros_dt(partida),
+        "chegada_iso":     parse_siros_dt(chegada),
+        "equipamento":     get_equip(equip),
+        "assentos":        int(assent) if assent and str(assent).isdigit() else None,
+        "tipo_operacao":   get_tipo_operacao(tipo),
+        "tipo_servico":    tipo or None,
+    }
+
+
+def registrar_execucao(
+    aeroportos: list,
+    voos_processados: int,
+    lotes_enviados: int,
+    erros: int,
+    status: str,
+    obs: str = "",
+) -> None:
+    """Grava o log de execução na tabela execucoes."""
+    try:
+        db.table("execucoes").insert({
+            "concluido_em":        datetime.now(timezone.utc).isoformat(),
+            "aeroportos_buscados": aeroportos,
+            "voos_processados":    voos_processados,
+            "lotes_enviados":      lotes_enviados,
+            "erros":               erros,
+            "status":              status,
+            "observacao":          obs or None,
+        }).execute()
+        print(f"\n  Log de execução salvo — status: {status}")
+    except Exception as e:
+        print(f"  [AVISO] Não foi possível salvar o log de execução: {e}")
+
+
+# ── Execução principal ────────────────────────────────────────────────────────
+
+todos_voos = buscar_voos_siros()
+
+if not todos_voos:
+    print("\n[AVISO] Nenhum voo retornado pela API SIROS. Encerrando.")
+    registrar_execucao(AIRPORTS, 0, 0, 0, "sem_dados",
+                       "API SIROS não retornou voos para a data.")
     sys.exit(0)
 
-registros   = processar_vra(linhas_vra)
-processados = 0
-erros       = 0
+# Filtra pelos aeroportos configurados e normaliza os registros
+registros = []
+for f in todos_voos:
+    origem  = (f.get("sg_icao_origem")  or "").strip().upper()
+    destino = (f.get("sg_icao_destino") or "").strip().upper()
+    if origem not in AIRPORTS and destino not in AIRPORTS:
+        continue
+    empresa = (f.get("sg_empresa_icao") or "").strip()
+    nr_voo  = (f.get("nr_voo")          or "").strip()
+    if not empresa or not nr_voo or not origem or not destino:
+        continue
+    registros.append(normalizar_voo(f))
+
+print(f"\nRegistros filtrados para os aeroportos configurados: {len(registros)}")
+print(
+    "  Obs: o upsert usa constraint voos_unique "
+    "(data_referencia + icao_empresa + numero_voo + icao_origem + icao_destino + etapa). "
+    "Voos já existentes são atualizados — sem duplicatas."
+)
+
+# Envio em lotes ao Supabase
+total_processados = 0
+total_lotes       = 0
+total_erros       = 0
 
 for i in range(0, len(registros), LOTE):
     lote     = registros[i:i + LOTE]
     num_lote = i // LOTE + 1
     try:
-        db.table("historico_vra").upsert(
+        db.table("voos").upsert(
             lote,
-            on_conflict="ano_mes,icao_empresa,nr_voo,icao_origem,icao_destino,dt_referencia",
+            on_conflict="data_referencia,icao_empresa,numero_voo,icao_origem,icao_destino,etapa",
         ).execute()
-        processados += len(lote)
+        total_processados += len(lote)
+        total_lotes       += 1
         print(f"  Lote {num_lote}: {len(lote)} registros enviados/processados")
     except Exception as e:
-        erros += 1
-        print(f"  [ERRO] Lote {num_lote}: {e}")
+        total_erros += 1
+        print(f"  [ERRO] Lote {num_lote} falhou: {e}")
 
-print(f"\nConcluído — {processados} registros históricos enviados/processados.")
-if erros > 0:
-    print(f"[ATENÇÃO] {erros} lote(s) com erro.")
+# Define status final
+if total_erros == 0:
+    status_final = "concluido"
+elif total_processados > 0:
+    status_final = "erro_parcial"
+else:
+    status_final = "erro_critico"
+
+obs = (
+    f"Data: {data_iso} | Aeroportos: {', '.join(AIRPORTS)} | "
+    f"Processados: {total_processados} | Lotes: {total_lotes} | Erros: {total_erros}"
+)
+
+registrar_execucao(
+    AIRPORTS, total_processados, total_lotes, total_erros, status_final, obs
+)
+
+print(f"\nConcluído — {total_processados} registros enviados/processados em {total_lotes} lote(s).")
+
+# Falha o workflow se houver qualquer erro parcial
+# (permite que o GitHub Actions marque o run como falha para monitoramento)
+if total_erros > 0:
+    print(f"\n[ATENÇÃO] {total_erros} lote(s) com erro — workflow finalizado com falha.")
     sys.exit(1)
