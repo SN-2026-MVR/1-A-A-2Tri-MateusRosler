@@ -211,7 +211,7 @@ unicos = {}
 
 for r in registros:
     chave = (
-        r["ano_mes"],
+        r["data_referencia"],
         r["icao_empresa"],
         r["nr_voo"],
         r["icao_origem"],
