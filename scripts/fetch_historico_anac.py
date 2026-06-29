@@ -67,8 +67,8 @@ VRA_URL = (
 
 # URL alternativa (portal de dados abertos)
 VRA_URL_ALT = (
-    f"https://sistemas.anac.gov.br/dadosabertos/"
-    f"Voos%20e%20opera%C3%A7%C3%B5es%20a%C3%A9reas/Voo%20Regular%20Ativo%20%28VRA%29/{ano}/{ano}{mes}.csv"
+     f"https://www.gov.br/anac/pt-br/assuntos/dados-e-estatisticas/"
+    f"dados-estatisticos/arquivos/VRA{ano}{mes}.csv"
 )
 
 # Mapeamento de colunas do CSV do VRA
